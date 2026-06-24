@@ -404,81 +404,47 @@ async function measureDownload() {
   return parseFloat((buf.byteLength * 8 / secs / 1e6).toFixed(2));
 }
 
-// Upload: pure JS benchmark — measures how fast the JS engine + memory bus can process
-// data, then cross-validates with an XHR to a CORS-open endpoint
+// Upload: real measurement via our own Cloudflare Worker endpoint.
+// The worker times how long it takes to receive the bytes we POST it —
+// that's the only way to get a real upload number for the user's own
+// connection (there's no way to measure outbound network speed with
+// pure JS, since no actual network I/O happens locally).
+const UPLOAD_ENDPOINT = 'https://netpulse-upload.tejasmishra18302.workers.dev/';
+
 async function measureUpload() {
-  const SIZE = 4 * 1024 * 1024; // 4MB
-
-  // Method 1: XHR to a public CORS-open echo endpoint
-  const tryXHR = (url, data, timeoutMs) => new Promise((resolve) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url, true);
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.timeout = timeoutMs;
-    const t0 = performance.now();
-    let resolved = false;
-    const done = (bytesSent) => {
-      if (resolved) return;
-      resolved = true;
-      const elapsed = (performance.now() - t0) / 1000;
-      if (elapsed < 0.1) { resolve(null); return; }
-      resolve(parseFloat((bytesSent * 8 / elapsed / 1e6).toFixed(2)));
-    };
-    xhr.upload.onprogress = (e) => {
-      if (e.loaded >= SIZE * 0.8) done(e.loaded);
-    };
-    xhr.onload = () => done(SIZE);
-    xhr.onerror = () => resolve(null);
-    xhr.ontimeout = () => done(xhr.upload._bytesSent || SIZE * 0.5);
-    const blob = new Blob([data]);
-    try { xhr.send(blob); } catch { resolve(null); }
-  });
-
-  // Method 2: Pure JS throughput (measures memory+CPU bandwidth, calibrated)
-  const jsThrottle = () => {
-    const buf = new ArrayBuffer(SIZE);
-    const view = new Uint8Array(buf);
-    crypto.getRandomValues(view.subarray(0, Math.min(65536, SIZE)));
-    // fill rest with pattern
-    for (let i = 65536; i < SIZE; i++) view[i] = view[i % 65536];
-    const t0 = performance.now();
-    // simulate serialisation work
-    let checksum = 0;
-    for (let i = 0; i < SIZE; i += 4) checksum ^= view[i];
-    const elapsed = (performance.now() - t0) / 1000;
-    // JS memory bus ~10x faster than network, so apply calibration factor
-    const raw = SIZE * 8 / elapsed / 1e6;
-    return Math.min(raw * 0.08, 120); // cap at 120 Mbps
-  };
+  const SIZE = 8 * 1024 * 1024; // 8MB payload — big enough for a stable reading
 
   const data = new Uint8Array(SIZE);
+  // random first 64KB, then repeat pattern (cheap to generate, fine since we're
+  // only timing transfer, not testing compression)
   crypto.getRandomValues(data.subarray(0, Math.min(65536, SIZE)));
   for (let i = 65536; i < SIZE; i++) data[i] = data[i % 65536];
+  const blob = new Blob([data]);
 
-  // Try real XHR first
-  const endpoints = [
-    'https://speed.cloudflare.com/__up',
-    'https://api.ipify.org?format=json', // won't accept POST nicely but gives timing
-  ];
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', UPLOAD_ENDPOINT + '?_=' + Date.now(), true);
+    xhr.timeout = 20000;
+    const t0 = performance.now();
 
-  // Cloudflare upload endpoint
-  let result = await tryXHR('https://speed.cloudflare.com/__up', data, 12000);
-  if (result && result > 0.5) return result;
-
-  // Fallback: use download speed as upload estimate (typical ratio ~0.3–0.8x)
-  // But first try the JS method which gives a rough estimate
-  const jsEst = jsThrottle();
-
-  // If we have download speed cached, estimate upload
-  const dlEl = document.getElementById('dl-v');
-  const dlVal = parseFloat(dlEl.textContent);
-  if (!isNaN(dlVal) && dlVal > 0) {
-    // typical upload is 30–80% of download for asymmetric connections
-    const estimate = parseFloat((dlVal * (0.3 + Math.random() * 0.4)).toFixed(2));
-    return estimate;
-  }
-
-  return parseFloat(jsEst.toFixed(2));
+    xhr.onload = () => {
+      const elapsed = (performance.now() - t0) / 1000;
+      if (elapsed <= 0) { reject(new Error('bad timing')); return; }
+      // Prefer the worker's own server-side elapsed time when available —
+      // it only counts time spent receiving bytes, no DNS/TLS overhead.
+      try {
+        const json = JSON.parse(xhr.responseText);
+        if (json && json.bytes && json.elapsed > 0) {
+          resolve(parseFloat((json.bytes * 8 / json.elapsed / 1e6).toFixed(2)));
+          return;
+        }
+      } catch {}
+      resolve(parseFloat((SIZE * 8 / elapsed / 1e6).toFixed(2)));
+    };
+    xhr.onerror = () => reject(new Error('upload failed — check your connection or the worker URL'));
+    xhr.ontimeout = () => reject(new Error('upload timed out'));
+    xhr.send(blob);
+  });
 }
 
 let liveTick = null;
