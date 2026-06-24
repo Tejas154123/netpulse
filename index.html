@@ -405,16 +405,18 @@ async function measureDownload() {
 }
 
 // Upload: real measurement via our own Cloudflare Worker endpoint.
-// The worker times how long it takes to receive the bytes we POST it —
-// that's the only way to get a real upload number for the user's own
-// connection (there's no way to measure outbound network speed with
-// pure JS, since no actual network I/O happens locally).
+//
+// IMPORTANT: timing this with just "time from xhr.send() to xhr.onload" is
+// unreliable. The browser can hand bytes off to the OS network buffer faster
+// than they actually go out over a slow uplink, so onload can fire close to
+// instantly even on a slow connection — that's what was causing the wildly
+// inflated 800–1600 Mbps readings here. The fix is to use
+// xhr.upload.onprogress, which reports bytes actually sent over the wire as
+// the OS reports them back to the browser, and measure throughput from that
+// progress stream directly instead of from total wall-clock time.
 const UPLOAD_ENDPOINT = 'https://netpulse-upload.tejasmishra18302.workers.dev/';
 
-// Runs one upload of `sizeBytes` and returns the measured Mbps (client-side timing,
-// from request start to response received — this is the real wall-clock time
-// your browser spent pushing bytes out, which is what we actually want).
-function uploadOnce(sizeBytes) {
+function uploadOnce(sizeBytes, timeoutMs) {
   const data = new Uint8Array(sizeBytes);
   crypto.getRandomValues(data.subarray(0, Math.min(65536, sizeBytes)));
   for (let i = 65536; i < sizeBytes; i++) data[i] = data[i % 65536];
@@ -423,12 +425,30 @@ function uploadOnce(sizeBytes) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', UPLOAD_ENDPOINT + '?_=' + Date.now() + Math.random(), true);
-    xhr.timeout = 20000;
-    const t0 = performance.now();
+    xhr.timeout = timeoutMs;
+
+    let firstProgressAt = null;
+    let lastLoaded = 0;
+    let lastTime = null;
+
+    xhr.upload.onprogress = (e) => {
+      const now = performance.now();
+      if (firstProgressAt === null) firstProgressAt = now;
+      lastLoaded = e.loaded;
+      lastTime = now;
+    };
 
     xhr.onload = () => {
-      const elapsed = (performance.now() - t0) / 1000;
-      resolve({ bytes: sizeBytes, elapsed, mbps: (sizeBytes * 8 / elapsed / 1e6) });
+      if (firstProgressAt === null || lastTime === null || lastLoaded < sizeBytes * 0.95) {
+        reject(new Error('upload did not complete cleanly'));
+        return;
+      }
+      // Measure from the FIRST progress event (bytes actually started moving)
+      // to the LAST one (transfer essentially done) — this window reflects
+      // real wire time, skipping the initial connection/TLS handshake.
+      const elapsed = (lastTime - firstProgressAt) / 1000;
+      if (elapsed < 0.05) { reject(new Error('transfer window too short to measure')); return; }
+      resolve({ bytes: lastLoaded, elapsed, mbps: (lastLoaded * 8 / elapsed / 1e6) });
     };
     xhr.onerror = () => reject(new Error('upload failed — check your connection or the worker URL'));
     xhr.ontimeout = () => reject(new Error('upload timed out'));
@@ -437,38 +457,40 @@ function uploadOnce(sizeBytes) {
 }
 
 async function measureUpload() {
-  // A small/fast probe can finish in well under 100ms, where connection setup,
-  // TLS, and edge buffering dominate the timing rather than your real sustained
-  // upload speed — that's what was causing wildly inflated numbers (800+ Mbps
-  // on a connection that only downloads at 76 Mbps). Fix: send a small probe
-  // first to gauge rough speed, then size a real payload so the transfer takes
-  // at least ~2.5 seconds — long enough that connection overhead becomes
-  // negligible and we're measuring sustained throughput instead of a burst.
+  // A single upload attempt is genuinely unreliable — connection warm-up,
+  // momentary congestion, or PoP routing changes can skew any one shot
+  // (this is why real speed test tools always run multiple trials and take
+  // a median rather than trusting a single number). Here we run 3 uploads:
+  // the first is treated as a warm-up (connection setup overhead skews it
+  // most) and discarded, then we take the median of the remaining two —
+  // actually we run one more after that so we have 2 "real" samples plus
+  // the warm-up, and use the higher-confidence of the two real samples by
+  // taking their median (effectively their average when there are 2).
+  const SIZE = 10 * 1024 * 1024; // 10MB — matches the download test size
 
-  const probe = await uploadOnce(512 * 1024); // 512KB probe
-  let mbpsGuess = probe.mbps;
-
-  // Guard: if the probe itself was suspiciously fast (<150ms), it's not
-  // trustworthy on its own — fall back to a conservative guess and let the
-  // full-size payload do the real measuring.
-  if (probe.elapsed < 0.15) mbpsGuess = Math.min(mbpsGuess, 100);
-
-  // Target ~2.5s of real transfer time, with sane bounds (1MB–60MB)
-  const targetBytes = Math.min(
-    60 * 1024 * 1024,
-    Math.max(1 * 1024 * 1024, Math.round(mbpsGuess * 1e6 / 8 * 2.5))
-  );
-
-  const result = await uploadOnce(targetBytes);
-
-  // Final sanity guard: if despite sizing it still finished too fast to trust
-  // (e.g. probe badly underestimated speed), redo once with the max payload.
-  if (result.elapsed < 0.5 && targetBytes < 60 * 1024 * 1024) {
-    const retry = await uploadOnce(60 * 1024 * 1024);
-    return parseFloat(retry.mbps.toFixed(2));
+  const samples = [];
+  for (let i = 0; i < 3; i++) {
+    try {
+      const result = await uploadOnce(SIZE, 20000);
+      samples.push(result.mbps);
+    } catch (e) {
+      // skip failed attempts, don't let one bad trial kill the whole test
+    }
   }
 
-  return parseFloat(result.mbps.toFixed(2));
+  if (samples.length === 0) throw new Error('all upload attempts failed');
+
+  // Discard the first sample (warm-up / connection setup skew) if we have
+  // more than one usable sample left after dropping it.
+  const usable = samples.length > 1 ? samples.slice(1) : samples;
+
+  usable.sort((a, b) => a - b);
+  const mid = Math.floor(usable.length / 2);
+  const median = usable.length % 2 !== 0
+    ? usable[mid]
+    : (usable[mid - 1] + usable[mid]) / 2;
+
+  return parseFloat(median.toFixed(2));
 }
 
 let liveTick = null;
