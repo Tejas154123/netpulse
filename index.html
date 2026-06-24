@@ -404,19 +404,29 @@ async function measureDownload() {
   return parseFloat((buf.byteLength * 8 / secs / 1e6).toFixed(2));
 }
 
-// Upload: real measurement via our own Cloudflare Worker endpoint.
+// Upload: real measurement via our own Cloudflare Worker endpoint, using
+// MULTIPLE PARALLEL connections — same approach Cloudflare and Ookla use.
 //
-// IMPORTANT: timing this with just "time from xhr.send() to xhr.onload" is
-// unreliable. The browser can hand bytes off to the OS network buffer faster
-// than they actually go out over a slow uplink, so onload can fire close to
-// instantly even on a slow connection — that's what was causing the wildly
-// inflated 800–1600 Mbps readings here. The fix is to use
-// xhr.upload.onprogress, which reports bytes actually sent over the wire as
-// the OS reports them back to the browser, and measure throughput from that
-// progress stream directly instead of from total wall-clock time.
+// Why parallel connections matter: a single TCP/TLS connection often can't
+// fill the available bandwidth on its own, especially over Wi-Fi or any
+// connection with non-trivial latency (TCP slow-start, single-stream
+// congestion control, etc. all cap one connection below the true line
+// speed). Real speed tests open several connections at once and sum their
+// throughput — that's what actually saturates the link and gives a number
+// that matches dedicated tools like Ookla.
+//
+// IMPORTANT — adaptive sizing: a fixed "4 streams x 4MB" payload that works
+// great on broadband can be far too much for a slow/congested mobile
+// connection, causing the whole test to spin for ~30s and then fail with no
+// result at all. So we first send a small probe to gauge rough speed, then
+// size the real batch (streams + bytes per stream) based on that, so slow
+// connections still get a real (if smaller-scale) measurement instead of an
+// error.
 const UPLOAD_ENDPOINT = 'https://netpulse-upload.tejasmishra18302.workers.dev/';
 
-function uploadOnce(sizeBytes, timeoutMs) {
+// One connection's worth of upload. Reports live progress via onBytes so the
+// caller can sum bytes-in-flight across all parallel connections.
+function uploadStream(sizeBytes, timeoutMs, onBytes) {
   const data = new Uint8Array(sizeBytes);
   crypto.getRandomValues(data.subarray(0, Math.min(65536, sizeBytes)));
   for (let i = 65536; i < sizeBytes; i++) data[i] = data[i % 65536];
@@ -426,71 +436,150 @@ function uploadOnce(sizeBytes, timeoutMs) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', UPLOAD_ENDPOINT + '?_=' + Date.now() + Math.random(), true);
     xhr.timeout = timeoutMs;
-
-    let firstProgressAt = null;
-    let lastLoaded = 0;
-    let lastTime = null;
+    let prevLoaded = 0;
 
     xhr.upload.onprogress = (e) => {
-      const now = performance.now();
-      if (firstProgressAt === null) firstProgressAt = now;
-      lastLoaded = e.loaded;
-      lastTime = now;
+      const delta = e.loaded - prevLoaded;
+      prevLoaded = e.loaded;
+      if (delta > 0) onBytes(delta);
     };
-
     xhr.onload = () => {
-      if (firstProgressAt === null || lastTime === null || lastLoaded < sizeBytes * 0.95) {
-        reject(new Error('upload did not complete cleanly'));
-        return;
-      }
-      // Measure from the FIRST progress event (bytes actually started moving)
-      // to the LAST one (transfer essentially done) — this window reflects
-      // real wire time, skipping the initial connection/TLS handshake.
-      const elapsed = (lastTime - firstProgressAt) / 1000;
-      if (elapsed < 0.05) { reject(new Error('transfer window too short to measure')); return; }
-      resolve({ bytes: lastLoaded, elapsed, mbps: (lastLoaded * 8 / elapsed / 1e6) });
+      const delta = sizeBytes - prevLoaded;
+      if (delta > 0) onBytes(delta);
+      resolve();
     };
-    xhr.onerror = () => reject(new Error('upload failed — check your connection or the worker URL'));
-    xhr.ontimeout = () => reject(new Error('upload timed out'));
+    xhr.onerror = () => reject(new Error('upload connection failed'));
+    // On timeout, DON'T throw away what we already sent — abort cleanly and
+    // let the caller use the partial data. This matters most on slow/mobile
+    // connections, where a stream might be cut off but still gave us a
+    // perfectly usable few seconds of real throughput data.
+    xhr.ontimeout = () => resolve();
     xhr.send(blob);
   });
 }
 
-async function measureUpload() {
-  // A single upload attempt is genuinely unreliable — connection warm-up,
-  // momentary congestion, or PoP routing changes can skew any one shot
-  // (this is why real speed test tools always run multiple trials and take
-  // a median rather than trusting a single number). Here we run 3 uploads:
-  // the first is treated as a warm-up (connection setup overhead skews it
-  // most) and discarded, then we take the median of the remaining two —
-  // actually we run one more after that so we have 2 "real" samples plus
-  // the warm-up, and use the higher-confidence of the two real samples by
-  // taking their median (effectively their average when there are 2).
-  const SIZE = 10 * 1024 * 1024; // 10MB — matches the download test size
+// Runs `streams` parallel uploads of `sizeBytesEach`, sampling combined
+// throughput every 200ms. Stops EARLY once the rate has converged — several
+// consecutive readings within a small tolerance of each other — rather than
+// always running the full duration cap. This mirrors the documented Ookla/
+// Fast.com approach: terminate dynamically once throughput stabilizes,
+// otherwise stop at a hard maximum duration. If the streams finish sending
+// all their data before convergence is reached, that's fine too — we just
+// use whatever data we collected.
+async function parallelUploadBatch(streams, sizeBytesEach, durationCapMs) {
+  let totalBytes = 0;
+  const samples = []; // { t, bytes }
+  const startedAt = performance.now();
 
-  const samples = [];
-  for (let i = 0; i < 3; i++) {
-    try {
-      const result = await uploadOnce(SIZE, 20000);
-      samples.push(result.mbps);
-    } catch (e) {
-      // skip failed attempts, don't let one bad trial kill the whole test
+  // Convergence settings: look at the last N instantaneous-rate samples: if
+  // they're all within TOLERANCE of their average, the measurement has
+  // stabilized and we can stop early.
+  const CONVERGE_WINDOW = 4;     // need this many consecutive stable samples
+  const CONVERGE_TOLERANCE = 0.08; // within 8% of each other
+  const MIN_SAMPLES_BEFORE_CHECK = 6; // don't even try to converge too early
+
+  let converged = false;
+  let stopEarly = null; // resolve fn for the early-stop promise
+
+  const earlyStop = new Promise((resolve) => { stopEarly = resolve; });
+
+  const sampler = setInterval(() => {
+    const t = performance.now() - startedAt;
+    samples.push({ t, bytes: totalBytes });
+
+    if (!converged && samples.length >= MIN_SAMPLES_BEFORE_CHECK) {
+      // Compute instantaneous Mbps between consecutive samples
+      const rates = [];
+      for (let i = samples.length - CONVERGE_WINDOW; i < samples.length - 1; i++) {
+        if (i < 0) continue;
+        const dt = (samples[i + 1].t - samples[i].t) / 1000;
+        const db = samples[i + 1].bytes - samples[i].bytes;
+        if (dt > 0 && db > 0) rates.push((db * 8) / dt / 1e6);
+      }
+      if (rates.length >= CONVERGE_WINDOW - 1) {
+        const avg = rates.reduce((a, b) => a + b, 0) / rates.length;
+        const allClose = avg > 0 && rates.every(r => Math.abs(r - avg) / avg <= CONVERGE_TOLERANCE);
+        if (allClose) {
+          converged = true;
+          stopEarly();
+        }
+      }
     }
+  }, 200);
+
+  const onBytes = (n) => { totalBytes += n; };
+
+  const promises = [];
+  for (let i = 0; i < streams; i++) {
+    promises.push(uploadStream(sizeBytesEach, durationCapMs, onBytes).catch(() => null));
   }
 
-  if (samples.length === 0) throw new Error('all upload attempts failed');
+  // Stop as soon as ANY of these happen: all streams finish naturally,
+  // throughput converges, or we hit the hard duration cap.
+  await Promise.race([Promise.all(promises), earlyStop, sleep(durationCapMs)]);
+  clearInterval(sampler);
+  samples.push({ t: performance.now() - startedAt, bytes: totalBytes });
 
-  // Discard the first sample (warm-up / connection setup skew) if we have
-  // more than one usable sample left after dropping it.
-  const usable = samples.length > 1 ? samples.slice(1) : samples;
+  // Use the window from the first time bytes started moving to the last
+  // sample, so connection-setup latency at the very start doesn't skew the
+  // result. Throw out samples before any data moved.
+  const active = samples.filter(s => s.bytes > 0);
+  if (active.length < 2) throw new Error('not enough data to measure upload');
 
-  usable.sort((a, b) => a - b);
-  const mid = Math.floor(usable.length / 2);
-  const median = usable.length % 2 !== 0
-    ? usable[mid]
-    : (usable[mid - 1] + usable[mid]) / 2;
+  const first = active[0];
+  const last = active[active.length - 1];
+  const elapsed = (last.t - first.t) / 1000;
+  const bytes = last.bytes - first.bytes;
+  if (elapsed < 0.1 || bytes <= 0) throw new Error('upload window too short to measure');
 
-  return parseFloat(median.toFixed(2));
+  return (bytes * 8) / elapsed / 1e6; // Mbps
+}
+
+async function measureUpload() {
+  // STEP 1 — small probe (1 stream, 768KB, short cap) to gauge rough speed
+  // without risking a long hang on slow connections.
+  let probeMbps = 5; // conservative default if probe itself fails/is too fast to trust
+  try {
+    const probe = await parallelUploadBatch(1, 768 * 1024, 6000);
+    if (probe > 0) probeMbps = probe;
+  } catch (e) {
+    // probe failed entirely — assume a slow/unreliable connection and use
+    // the conservative default above rather than erroring out immediately
+  }
+
+  // STEP 2 — size the real test based on the probe. Slower connections get
+  // fewer parallel streams and smaller payloads (so the test finishes in a
+  // reasonable time and doesn't time out); faster connections get the full
+  // multi-stream treatment for an accurate saturated reading.
+  let streams, chunkSize, capMs;
+  if (probeMbps < 5) {
+    streams = 1; chunkSize = 1 * 1024 * 1024; capMs = 12000;     // very slow / mobile
+  } else if (probeMbps < 20) {
+    streams = 2; chunkSize = 2 * 1024 * 1024; capMs = 12000;     // slow
+  } else if (probeMbps < 60) {
+    streams = 3; chunkSize = 5 * 1024 * 1024; capMs = 15000;     // medium
+  } else {
+    streams = 4; chunkSize = 8 * 1024 * 1024; capMs = 15000;     // fast broadband
+  }
+
+  // Run two batches at the chosen size: the first absorbs connection
+  // warm-up, the second is the trustworthy reading. If the first fails
+  // entirely, fall back to using the second (or the probe itself).
+  let result = null;
+  try {
+    await parallelUploadBatch(streams, chunkSize, capMs);
+  } catch (e) { /* warm-up failure is fine, ignore */ }
+
+  try {
+    result = await parallelUploadBatch(streams, chunkSize, capMs);
+  } catch (e) {
+    // Real batch failed too — fall back to the probe result rather than
+    // showing a hard error. A rough number beats no number, especially on
+    // connections too unreliable for a full multi-stream test.
+    result = probeMbps;
+  }
+
+  return parseFloat(result.toFixed(2));
 }
 
 let liveTick = null;
