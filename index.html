@@ -474,9 +474,17 @@ async function parallelUploadBatch(streams, sizeBytesEach, durationCapMs) {
   // Convergence settings: look at the last N instantaneous-rate samples: if
   // they're all within TOLERANCE of their average, the measurement has
   // stabilized and we can stop early.
-  const CONVERGE_WINDOW = 4;     // need this many consecutive stable samples
-  const CONVERGE_TOLERANCE = 0.08; // within 8% of each other
-  const MIN_SAMPLES_BEFORE_CHECK = 6; // don't even try to converge too early
+  //
+  // IMPORTANT: TCP connections have a "slow start" period (often 1-2+
+  // seconds) where throughput ramps up from low to its real sustained rate.
+  // If convergence is allowed to trigger too early, it can mistake a
+  // deceptively *stable but still ramping* low reading for a converged
+  // result — locking in a falsely low number. MIN_SAMPLES_BEFORE_CHECK is
+  // deliberately set high enough (2.4s) to get past slow-start on most
+  // connections before we even start looking for stability.
+  const CONVERGE_WINDOW = 5;       // need this many consecutive stable samples
+  const CONVERGE_TOLERANCE = 0.06; // within 6% of each other
+  const MIN_SAMPLES_BEFORE_CHECK = 12; // ~2.4s minimum before convergence can trigger
 
   let converged = false;
   let stopEarly = null; // resolve fn for the early-stop promise
@@ -563,20 +571,44 @@ async function measureUpload() {
   }
 
   // Run two batches at the chosen size: the first absorbs connection
-  // warm-up, the second is the trustworthy reading. If the first fails
-  // entirely, fall back to using the second (or the probe itself).
-  let result = null;
+  // warm-up, the second is the trustworthy reading. If they disagree wildly
+  // (more than 2x apart), that's a sign one of them was thrown off by a
+  // momentary blip rather than reflecting real sustained throughput — in
+  // that case run a third batch as a tie-breaker and use the median of all
+  // valid readings instead of blindly trusting whichever ran second.
+  const readings = [];
+
   try {
-    await parallelUploadBatch(streams, chunkSize, capMs);
+    const warmup = await parallelUploadBatch(streams, chunkSize, capMs);
+    readings.push(warmup);
   } catch (e) { /* warm-up failure is fine, ignore */ }
 
   try {
-    result = await parallelUploadBatch(streams, chunkSize, capMs);
-  } catch (e) {
-    // Real batch failed too — fall back to the probe result rather than
-    // showing a hard error. A rough number beats no number, especially on
-    // connections too unreliable for a full multi-stream test.
-    result = probeMbps;
+    const real = await parallelUploadBatch(streams, chunkSize, capMs);
+    readings.push(real);
+  } catch (e) { /* will fall back below if needed */ }
+
+  // If we have 2 readings that disagree by more than 2x, get a tie-breaker
+  if (readings.length === 2) {
+    const [a, b] = readings;
+    const ratio = Math.max(a, b) / Math.min(a, b);
+    if (ratio > 2) {
+      try {
+        const tiebreak = await parallelUploadBatch(streams, chunkSize, capMs);
+        readings.push(tiebreak);
+      } catch (e) { /* if this also fails, proceed with what we have */ }
+    }
+  }
+
+  let result;
+  if (readings.length === 0) {
+    result = probeMbps; // everything failed — fall back to the probe
+  } else {
+    readings.sort((a, b) => a - b);
+    const mid = Math.floor(readings.length / 2);
+    result = readings.length % 2 !== 0
+      ? readings[mid]
+      : (readings[mid - 1] + readings[mid]) / 2;
   }
 
   return parseFloat(result.toFixed(2));
