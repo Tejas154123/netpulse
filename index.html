@@ -411,40 +411,64 @@ async function measureDownload() {
 // pure JS, since no actual network I/O happens locally).
 const UPLOAD_ENDPOINT = 'https://netpulse-upload.tejasmishra18302.workers.dev/';
 
-async function measureUpload() {
-  const SIZE = 8 * 1024 * 1024; // 8MB payload — big enough for a stable reading
-
-  const data = new Uint8Array(SIZE);
-  // random first 64KB, then repeat pattern (cheap to generate, fine since we're
-  // only timing transfer, not testing compression)
-  crypto.getRandomValues(data.subarray(0, Math.min(65536, SIZE)));
-  for (let i = 65536; i < SIZE; i++) data[i] = data[i % 65536];
+// Runs one upload of `sizeBytes` and returns the measured Mbps (client-side timing,
+// from request start to response received — this is the real wall-clock time
+// your browser spent pushing bytes out, which is what we actually want).
+function uploadOnce(sizeBytes) {
+  const data = new Uint8Array(sizeBytes);
+  crypto.getRandomValues(data.subarray(0, Math.min(65536, sizeBytes)));
+  for (let i = 65536; i < sizeBytes; i++) data[i] = data[i % 65536];
   const blob = new Blob([data]);
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', UPLOAD_ENDPOINT + '?_=' + Date.now(), true);
+    xhr.open('POST', UPLOAD_ENDPOINT + '?_=' + Date.now() + Math.random(), true);
     xhr.timeout = 20000;
     const t0 = performance.now();
 
     xhr.onload = () => {
       const elapsed = (performance.now() - t0) / 1000;
-      if (elapsed <= 0) { reject(new Error('bad timing')); return; }
-      // Prefer the worker's own server-side elapsed time when available —
-      // it only counts time spent receiving bytes, no DNS/TLS overhead.
-      try {
-        const json = JSON.parse(xhr.responseText);
-        if (json && json.bytes && json.elapsed > 0) {
-          resolve(parseFloat((json.bytes * 8 / json.elapsed / 1e6).toFixed(2)));
-          return;
-        }
-      } catch {}
-      resolve(parseFloat((SIZE * 8 / elapsed / 1e6).toFixed(2)));
+      resolve({ bytes: sizeBytes, elapsed, mbps: (sizeBytes * 8 / elapsed / 1e6) });
     };
     xhr.onerror = () => reject(new Error('upload failed — check your connection or the worker URL'));
     xhr.ontimeout = () => reject(new Error('upload timed out'));
     xhr.send(blob);
   });
+}
+
+async function measureUpload() {
+  // A small/fast probe can finish in well under 100ms, where connection setup,
+  // TLS, and edge buffering dominate the timing rather than your real sustained
+  // upload speed — that's what was causing wildly inflated numbers (800+ Mbps
+  // on a connection that only downloads at 76 Mbps). Fix: send a small probe
+  // first to gauge rough speed, then size a real payload so the transfer takes
+  // at least ~2.5 seconds — long enough that connection overhead becomes
+  // negligible and we're measuring sustained throughput instead of a burst.
+
+  const probe = await uploadOnce(512 * 1024); // 512KB probe
+  let mbpsGuess = probe.mbps;
+
+  // Guard: if the probe itself was suspiciously fast (<150ms), it's not
+  // trustworthy on its own — fall back to a conservative guess and let the
+  // full-size payload do the real measuring.
+  if (probe.elapsed < 0.15) mbpsGuess = Math.min(mbpsGuess, 100);
+
+  // Target ~2.5s of real transfer time, with sane bounds (1MB–60MB)
+  const targetBytes = Math.min(
+    60 * 1024 * 1024,
+    Math.max(1 * 1024 * 1024, Math.round(mbpsGuess * 1e6 / 8 * 2.5))
+  );
+
+  const result = await uploadOnce(targetBytes);
+
+  // Final sanity guard: if despite sizing it still finished too fast to trust
+  // (e.g. probe badly underestimated speed), redo once with the max payload.
+  if (result.elapsed < 0.5 && targetBytes < 60 * 1024 * 1024) {
+    const retry = await uploadOnce(60 * 1024 * 1024);
+    return parseFloat(retry.mbps.toFixed(2));
+  }
+
+  return parseFloat(result.mbps.toFixed(2));
 }
 
 let liveTick = null;
