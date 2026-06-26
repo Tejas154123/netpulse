@@ -395,13 +395,137 @@ async function measurePing() {
   return Math.round(times[1]);
 }
 
+// Download: same problem as upload had — a single fetch() of a fixed-size
+// file under-reads on fast connections, because TCP slow-start eats a big
+// chunk of a short transfer window, and there's no parallelism to actually
+// saturate the link. Fixed the same way: parallel connections + adaptive
+// sizing based on a quick probe, same as measureUpload().
+function downloadStream(bytes, timeoutMs, onBytes) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', `https://speed.cloudflare.com/__down?bytes=${bytes}&_=${Date.now()}${Math.random()}`, true);
+    xhr.responseType = 'arraybuffer';
+    xhr.timeout = timeoutMs;
+    let prevLoaded = 0;
+
+    xhr.onprogress = (e) => {
+      const delta = e.loaded - prevLoaded;
+      prevLoaded = e.loaded;
+      if (delta > 0) onBytes(delta);
+    };
+    xhr.onload = () => {
+      const delta = (xhr.response ? xhr.response.byteLength : bytes) - prevLoaded;
+      if (delta > 0) onBytes(delta);
+      resolve();
+    };
+    xhr.onerror = () => reject(new Error('download connection failed'));
+    xhr.ontimeout = () => resolve(); // keep partial data, same as upload
+    xhr.send();
+  });
+}
+
+async function parallelDownloadBatch(streams, bytesEach, durationCapMs) {
+  let totalBytes = 0;
+  const samples = [];
+  const startedAt = performance.now();
+
+  const CONVERGE_WINDOW = 5;
+  const CONVERGE_TOLERANCE = 0.06;
+  const MIN_SAMPLES_BEFORE_CHECK = 12; // ~2.4s, same slow-start protection as upload
+
+  let converged = false;
+  let stopEarly = null;
+  const earlyStop = new Promise((resolve) => { stopEarly = resolve; });
+
+  const sampler = setInterval(() => {
+    const t = performance.now() - startedAt;
+    samples.push({ t, bytes: totalBytes });
+
+    if (!converged && samples.length >= MIN_SAMPLES_BEFORE_CHECK) {
+      const rates = [];
+      for (let i = samples.length - CONVERGE_WINDOW; i < samples.length - 1; i++) {
+        if (i < 0) continue;
+        const dt = (samples[i + 1].t - samples[i].t) / 1000;
+        const db = samples[i + 1].bytes - samples[i].bytes;
+        if (dt > 0 && db > 0) rates.push((db * 8) / dt / 1e6);
+      }
+      if (rates.length >= CONVERGE_WINDOW - 1) {
+        const avg = rates.reduce((a, b) => a + b, 0) / rates.length;
+        const allClose = avg > 0 && rates.every(r => Math.abs(r - avg) / avg <= CONVERGE_TOLERANCE);
+        if (allClose) { converged = true; stopEarly(); }
+      }
+    }
+  }, 200);
+
+  const onBytes = (n) => { totalBytes += n; };
+  const promises = [];
+  for (let i = 0; i < streams; i++) {
+    promises.push(downloadStream(bytesEach, durationCapMs, onBytes).catch(() => null));
+  }
+
+  await Promise.race([Promise.all(promises), earlyStop, sleep(durationCapMs)]);
+  clearInterval(sampler);
+  samples.push({ t: performance.now() - startedAt, bytes: totalBytes });
+
+  const active = samples.filter(s => s.bytes > 0);
+  if (active.length < 2) throw new Error('not enough data to measure download');
+
+  const first = active[0];
+  const last = active[active.length - 1];
+  const elapsed = (last.t - first.t) / 1000;
+  const bytes = last.bytes - first.bytes;
+  if (elapsed < 0.1 || bytes <= 0) throw new Error('download window too short to measure');
+
+  return (bytes * 8) / elapsed / 1e6;
+}
+
 async function measureDownload() {
-  const url = 'https://speed.cloudflare.com/__down?bytes=10000000&_=' + Date.now();
-  const t0 = performance.now();
-  const r = await fetch(url, { cache: 'no-store' });
-  const buf = await r.arrayBuffer();
-  const secs = (performance.now() - t0) / 1000;
-  return parseFloat((buf.byteLength * 8 / secs / 1e6).toFixed(2));
+  // Probe first to gauge rough speed, same pattern as upload, so we pick an
+  // appropriately scaled test instead of a one-size-fits-all 10MB fetch.
+  let probeMbps = 10;
+  try {
+    const probe = await parallelDownloadBatch(1, 2 * 1024 * 1024, 6000);
+    if (probe > 0) probeMbps = probe;
+  } catch (e) { /* keep default */ }
+
+  // Tiers go higher than upload's, since download is typically the faster
+  // direction and needs more headroom to actually saturate fast lines
+  // (200+ Mbps fiber connections need real parallelism + real data volume
+  // to avoid plateauing the same way the old single-fetch version did).
+  let streams, bytesEach, capMs;
+  if (probeMbps < 10) {
+    streams = 1; bytesEach = 3 * 1024 * 1024; capMs = 12000;        // very slow
+  } else if (probeMbps < 40) {
+    streams = 2; bytesEach = 8 * 1024 * 1024; capMs = 12000;        // slow/medium
+  } else if (probeMbps < 100) {
+    streams = 4; bytesEach = 15 * 1024 * 1024; capMs = 15000;       // fast broadband
+  } else if (probeMbps < 250) {
+    streams = 6; bytesEach = 25 * 1024 * 1024; capMs = 15000;       // very fast
+  } else {
+    streams = 8; bytesEach = 35 * 1024 * 1024; capMs = 15000;       // gigabit-class
+  }
+
+  const readings = [];
+  try { readings.push(await parallelDownloadBatch(streams, bytesEach, capMs)); } catch (e) {}
+  try { readings.push(await parallelDownloadBatch(streams, bytesEach, capMs)); } catch (e) {}
+
+  if (readings.length === 2) {
+    const ratio = Math.max(...readings) / Math.min(...readings);
+    if (ratio > 2) {
+      try { readings.push(await parallelDownloadBatch(streams, bytesEach, capMs)); } catch (e) {}
+    }
+  }
+
+  let result;
+  if (readings.length === 0) {
+    result = probeMbps;
+  } else {
+    readings.sort((a, b) => a - b);
+    const mid = Math.floor(readings.length / 2);
+    result = readings.length % 2 !== 0 ? readings[mid] : (readings[mid - 1] + readings[mid]) / 2;
+  }
+
+  return parseFloat(result.toFixed(2));
 }
 
 // Upload: real measurement via our own Cloudflare Worker endpoint, using
@@ -566,8 +690,12 @@ async function measureUpload() {
     streams = 2; chunkSize = 2 * 1024 * 1024; capMs = 12000;     // slow
   } else if (probeMbps < 60) {
     streams = 3; chunkSize = 5 * 1024 * 1024; capMs = 15000;     // medium
-  } else {
+  } else if (probeMbps < 150) {
     streams = 4; chunkSize = 8 * 1024 * 1024; capMs = 15000;     // fast broadband
+  } else if (probeMbps < 350) {
+    streams = 6; chunkSize = 12 * 1024 * 1024; capMs = 15000;    // very fast
+  } else {
+    streams = 8; chunkSize = 16 * 1024 * 1024; capMs = 15000;    // gigabit-class
   }
 
   // Run two batches at the chosen size: the first absorbs connection
